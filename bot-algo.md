@@ -1,3 +1,5 @@
+Unikeys: sjun0216, jmot0574, enik0756
+
 How are tiles handled?
 - Tiles are rotated and evaluated for placement based on river continuity, adjacency to existing tiles, and avoidance of problematic U-turns. A heuristic scores nearby open positions by connection density and distance from center.
 
