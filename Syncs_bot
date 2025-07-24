@@ -1,0 +1,243 @@
+#### DISCLAIMER ####
+# This was produced with the assistance of GPT-4o
+
+from helper.game import Game
+from lib.interface.events.moves.move_place_meeple import MovePlaceMeeple, MovePlaceMeeplePass
+from lib.interface.events.moves.move_place_tile import MovePlaceTile
+from lib.interface.queries.typing import QueryType
+from lib.interface.queries.query_place_tile import QueryPlaceTile
+from lib.interface.queries.query_place_meeple import QueryPlaceMeeple
+from lib.interface.events.moves.typing import MoveType
+from lib.models.tile_model import TileModel
+
+import time
+import random
+import copy
+
+class BotState:
+    def __init__(self) -> None:
+        self.last_tile_model: TileModel | None = None
+        self.last_tile_obj: any = None
+
+def main() -> None:
+    game = Game()
+    bot_state = BotState()
+
+    def choose_move(query: QueryType) -> MoveType:
+        match query:
+            case QueryPlaceTile() as q:
+                return handle_place_tile(game, bot_state, q)
+            case QueryPlaceMeeple() as q:
+                return handle_place_meeple(game, bot_state, q)
+
+    while True:
+        query = game.get_next_query()
+        game.send_move(choose_move(query))
+
+# === Tile Placement ===
+
+# === Tile Placement Utilities ===
+
+def connects_to_existing_river(tile: TileModel, grid, x, y) -> bool:
+    directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+
+    for edge_index, (dx, dy) in enumerate(directions):
+        nx, ny = x + dx, y + dy
+        if 0 <= ny < len(grid) and 0 <= nx < len(grid[0]):
+            neighbor = grid[ny][nx]
+            if neighbor:
+                neighbor_edge_index = (edge_index + 2) % 4
+                tile_edge = tile.edges[edge_index].lower()
+                neighbor_tile_edge = neighbor.edges[neighbor_edge_index].lower()
+
+                # If neighbor expects a river
+                if "river" in neighbor_tile_edge:
+                    if "river" not in tile_edge:
+                        return False  # Neighbor expects river but this tile doesn't match
+                    else:
+                        return True  # Valid river connection
+                elif "river" in tile_edge:
+                    return False  # This tile has river but neighbor does not
+
+    return False  # No valid river connection found
+
+
+def is_potential_river_uturn(tile: TileModel, grid, x, y):
+    if "river" not in tile.tile_type.lower():
+        return False
+
+    river_edges = {i for i, e in enumerate(tile.edges) if "river" in e.lower()}
+    if len(river_edges) != 2:
+        return False
+
+    open_ends = get_open_river_endpoints(grid)
+
+    match_count = 0
+    for edge_index in river_edges:
+        dx, dy = [(0, -1), (1, 0), (0, 1), (-1, 0)][edge_index]
+        nx, ny = x + dx, y + dy
+        expected_match_side = (edge_index + 2) % 4
+        if ((nx, ny), expected_match_side) in open_ends:
+            match_count += 1
+
+    if match_count == 1:
+        edge_list = sorted(list(river_edges))
+        edge_diff = abs(edge_list[0] - edge_list[1])
+        if edge_diff == 1 or edge_diff == 3:
+            return True
+
+    return match_count < 2
+
+def get_candidate_positions(grid, center, limit=20):
+    h, w = len(grid), len(grid[0])
+    cx, cy = center
+    candidates = set()
+
+    for y in range(h):
+        for x in range(w):
+            if grid[y][x] is not None:
+                for dx, dy in [(0, -1), (1, 0), (0, 1), (-1, 0)]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < w and 0 <= ny < h and grid[ny][nx] is None:
+                        candidates.add((nx, ny))
+
+    scored = []
+    for (x, y) in candidates:
+        connections = sum(
+            0 <= x+dx < w and 0 <= y+dy < h and grid[y+dy][x+dx] is not None
+            for dx, dy in [(0, -1), (1, 0), (0, 1), (-1, 0)]
+        )
+        dist = abs(x - cx) + abs(y - cy)
+        scored.append((x, y, -connections, dist))
+
+    sorted_candidates = sorted(scored, key=lambda t: (t[2], t[3]))
+    top_candidates = [(x, y) for (x, y, _, _) in sorted_candidates[:2*limit]]
+    return random.sample(top_candidates, k=min(limit, len(top_candidates)))
+
+def fallback_or_timeout(move, game, bot_state, query):
+    if move:
+        index, tile = move
+        x, y = tile.placed_pos
+        if "river" in tile.tile_type.lower():
+            if not connects_to_existing_river(tile, game.state.map._grid, x, y):
+                return game.move_place_meeple_pass(query)
+            if is_potential_river_uturn(tile, game.state.map._grid, x, y):
+                return game.move_place_meeple_pass(query)
+        if game.can_place_tile_at(tile, x, y):
+            return place_tile(tile, index, x, y, bot_state, game, query)
+    return game.move_place_meeple_pass(query)
+
+def place_tile(tile, index, x, y, bot_state, game, query):
+    tile.placed_pos = (x, y)
+    model = tile._to_model()
+    bot_state.last_tile_model = model
+    bot_state.last_tile_obj = tile
+    return game.move_place_tile(query, model, index)
+
+def get_open_river_endpoints(grid):
+    open_ends = []
+    directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+
+    for y in range(len(grid)):
+        for x in range(len(grid[0])):
+            tile = grid[y][x]
+            if tile and "river" in tile.tile_type.lower():
+                for edge_index, (dx, dy) in enumerate(directions):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= ny < len(grid) and 0 <= nx < len(grid[0]) and grid[ny][nx] is None:
+                        if "river" in tile.edges[edge_index].lower():
+                            open_ends.append(((nx, ny), (edge_index + 2) % 4))
+    return open_ends
+
+def handle_place_tile(game: Game, bot_state: BotState, query: QueryPlaceTile) -> MovePlaceTile:
+    start = time.monotonic()
+    TIME_LIMIT = 0.15
+    MAX_TOTAL_CHECKS = 100
+    fallback_move = None
+    total_checks = 0
+    tried = set()
+
+    grid = game.state.map._grid
+    h, w = len(grid), len(grid[0])
+    center = (w // 2, h // 2)
+    candidates = get_candidate_positions(grid, center, limit=20)
+
+    tile_indices = list(range(len(game.state.my_tiles)))
+    random.shuffle(tile_indices)
+
+    for tile_index in tile_indices:
+        base_tile = game.state.my_tiles[tile_index]
+        is_river_tile = "river" in base_tile.tile_type.lower()
+        river_phase = getattr(game.state, "river_phase", False)
+
+        if is_river_tile and not river_phase:
+            continue
+
+        for rotation in range(4):
+            tile = copy.deepcopy(base_tile)
+            for _ in range(rotation):
+                tile.rotate()
+            tile.rotation = rotation
+
+            for x, y in candidates:
+                if time.monotonic() - start > TIME_LIMIT or total_checks >= MAX_TOTAL_CHECKS:
+                    return fallback_or_timeout(fallback_move, game, bot_state, query)
+
+                key = (tile.tile_type, tile.rotation, x, y)
+                if key in tried:
+                    continue
+                tried.add(key)
+                total_checks += 1
+                tile.placed_pos = (x, y)
+
+                if is_river_tile:
+                    if not connects_to_existing_river(tile, grid, x, y):
+                        continue
+                    if is_potential_river_uturn(tile, grid, x, y):
+                        continue
+
+                if game.can_place_tile_at(tile, x, y):
+                    return place_tile(tile, tile_index, x, y, bot_state, game, query)
+
+                if fallback_move is None and game.can_place_tile_at(tile, x, y):
+                    if not is_river_tile:
+                        fallback_move = (tile_index, tile)
+                    elif (
+                        connects_to_existing_river(tile, grid, x, y) and
+                        not is_potential_river_uturn(tile, grid, x, y)
+                    ):
+                        fallback_move = (tile_index, tile)
+
+    return fallback_or_timeout(fallback_move, game, bot_state, query)
+
+# === Meeple Placement ===
+
+def handle_place_meeple(game: Game, bot_state: BotState, query: QueryPlaceMeeple) -> MovePlaceMeeple | MovePlaceMeeplePass:
+    tile_model, tile = bot_state.last_tile_model, bot_state.last_tile_obj
+    if not tile_model or not tile:
+        return game.move_place_meeple_pass(query)
+
+    x, y = tile_model.pos
+    placed_tile = game.state.map._grid[y][x]
+    if placed_tile is None:
+        return game.move_place_meeple_pass(query)
+
+    bot_state.last_tile_model = None
+    bot_state.last_tile_obj = None
+
+    structures = game.state.get_placeable_structures(tile_model)
+    preferred = {"monastery", "city", "road"}
+
+    for edge in structures:
+        if any(p in edge.lower() for p in preferred):
+            if not game.state._get_claims(placed_tile, edge):
+                return game.move_place_meeple(query, tile_model, placed_on=edge)
+
+    for edge in structures:
+        if not game.state._get_claims(placed_tile, edge):
+            return game.move_place_meeple(query, tile_model, placed_on=edge)
+
+    return game.move_place_meeple_pass(query)
+
+if __name__ == "__main__":
+    main()
